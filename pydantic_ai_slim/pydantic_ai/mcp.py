@@ -5,21 +5,24 @@ import functools
 import warnings
 from abc import ABC, abstractmethod
 from asyncio import Lock
-from collections.abc import AsyncIterator, Awaitable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager
 from dataclasses import field, replace
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, Callable
+from typing import Annotated, Any
 
 import anyio
 import httpx
 import pydantic_core
 from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
+from pydantic import BaseModel, Discriminator, Field, Tag
+from pydantic_core import CoreSchema, core_schema
 from typing_extensions import Self, assert_never, deprecated
 
 from pydantic_ai.tools import RunContext, ToolDefinition
 
+from .direct import model_request
 from .toolsets.abstract import AbstractToolset, ToolsetTool
 
 try:
@@ -40,7 +43,7 @@ except ImportError as _import_error:
 # after mcp imports so any import error maps to this file, not _mcp.py
 from . import _mcp, _utils, exceptions, messages, models
 
-__all__ = 'MCPServer', 'MCPServerStdio', 'MCPServerHTTP', 'MCPServerSSE', 'MCPServerStreamableHTTP'
+__all__ = 'MCPServer', 'MCPServerStdio', 'MCPServerHTTP', 'MCPServerSSE', 'MCPServerStreamableHTTP', 'load_mcp_servers'
 
 TOOL_SCHEMA_VALIDATOR = pydantic_core.SchemaValidator(
     schema=pydantic_core.core_schema.dict_schema(
@@ -253,6 +256,11 @@ class MCPServer(AbstractToolset[Any], ABC):
                     name=name,
                     description=mcp_tool.description,
                     parameters_json_schema=mcp_tool.inputSchema,
+                    metadata={
+                        'meta': mcp_tool.meta,
+                        'annotations': mcp_tool.annotations.model_dump() if mcp_tool.annotations else None,
+                        'output_schema': mcp_tool.outputSchema or None,
+                    },
                 ),
             )
             for mcp_tool in await self.list_tools()
@@ -300,6 +308,8 @@ class MCPServer(AbstractToolset[Any], ABC):
         return self
 
     async def __aexit__(self, *args: Any) -> bool | None:
+        if self._running_count == 0:
+            raise ValueError('MCPServer.__aexit__ called more times than __aenter__')
         async with self._enter_lock:
             self._running_count -= 1
             if self._running_count == 0 and self._exit_stack is not None:
@@ -327,11 +337,7 @@ class MCPServer(AbstractToolset[Any], ABC):
         if stop_sequences := params.stopSequences:  # pragma: no branch
             model_settings['stop_sequences'] = stop_sequences
 
-        model_response = await self.sampling_model.request(
-            pai_messages,
-            model_settings,
-            models.ModelRequestParameters(),
-        )
+        model_response = await model_request(self.sampling_model, pai_messages, model_settings=model_settings)
         return mcp_types.CreateMessageResult(
             role='assistant',
             content=_mcp.map_from_model_response(model_response),
@@ -401,16 +407,7 @@ class MCPServerStdio(MCPServer):
     from pydantic_ai.mcp import MCPServerStdio
 
     server = MCPServerStdio(  # (1)!
-        'deno',
-        args=[
-            'run',
-            '-N',
-            '-R=node_modules',
-            '-W=node_modules',
-            '--node-modules-dir=auto',
-            'jsr:@pydantic/mcp-run-python',
-            'stdio',
-        ]
+        'uv', args=['run', 'mcp-run-python', 'stdio'], timeout=10
     )
     agent = Agent('openai:gpt-4o', toolsets=[server])
 
@@ -419,7 +416,7 @@ class MCPServerStdio(MCPServer):
             ...
     ```
 
-    1. See [MCP Run Python](../mcp/run-python.md) for more information.
+    1. See [MCP Run Python](https://github.com/pydantic/mcp-run-python) for more information.
     2. This will start the server as a subprocess and connect to it.
     """
 
@@ -455,6 +452,7 @@ class MCPServerStdio(MCPServer):
         self,
         command: str,
         args: Sequence[str],
+        *,
         env: dict[str, str] | None = None,
         cwd: str | Path | None = None,
         tool_prefix: str | None = None,
@@ -467,7 +465,6 @@ class MCPServerStdio(MCPServer):
         sampling_model: models.Model | None = None,
         max_retries: int = 1,
         elicitation_callback: ElicitationFnT | None = None,
-        *,
         id: str | None = None,
     ):
         """Build a new MCP server.
@@ -508,6 +505,22 @@ class MCPServerStdio(MCPServer):
             id=id,
         )
 
+    @classmethod
+    def __get_pydantic_core_schema__(cls, _: Any, __: Any) -> CoreSchema:
+        return core_schema.no_info_after_validator_function(
+            lambda dct: MCPServerStdio(**dct),
+            core_schema.typed_dict_schema(
+                {
+                    'command': core_schema.typed_dict_field(core_schema.str_schema()),
+                    'args': core_schema.typed_dict_field(core_schema.list_schema(core_schema.str_schema())),
+                    'env': core_schema.typed_dict_field(
+                        core_schema.dict_schema(core_schema.str_schema(), core_schema.str_schema()),
+                        required=False,
+                    ),
+                }
+            ),
+        )
+
     @asynccontextmanager
     async def client_streams(
         self,
@@ -527,8 +540,18 @@ class MCPServerStdio(MCPServer):
             f'args={self.args!r}',
         ]
         if self.id:
-            repr_args.append(f'id={self.id!r}')  # pragma: no cover
+            repr_args.append(f'id={self.id!r}')
         return f'{self.__class__.__name__}({", ".join(repr_args)})'
+
+    def __eq__(self, value: object, /) -> bool:
+        if not isinstance(value, MCPServerStdio):
+            return False  # pragma: no cover
+        return (
+            self.command == value.command
+            and self.args == value.args
+            and self.env == value.env
+            and self.cwd == value.cwd
+        )
 
 
 class _MCPServerHTTP(MCPServer):
@@ -581,8 +604,8 @@ class _MCPServerHTTP(MCPServer):
 
     def __init__(
         self,
-        *,
         url: str,
+        *,
         headers: dict[str, str] | None = None,
         http_client: httpx.AsyncClient | None = None,
         id: str | None = None,
@@ -732,21 +755,39 @@ class MCPServerSSE(_MCPServerHTTP):
     from pydantic_ai import Agent
     from pydantic_ai.mcp import MCPServerSSE
 
-    server = MCPServerSSE('http://localhost:3001/sse')  # (1)!
+    server = MCPServerSSE('http://localhost:3001/sse')
     agent = Agent('openai:gpt-4o', toolsets=[server])
 
     async def main():
-        async with agent:  # (2)!
+        async with agent:  # (1)!
             ...
     ```
 
-    1. E.g. you might be connecting to a server run with [`mcp-run-python`](../mcp/run-python.md).
-    2. This will connect to a server running on `localhost:3001`.
+    1. This will connect to a server running on `localhost:3001`.
     """
+
+    @classmethod
+    def __get_pydantic_core_schema__(cls, _: Any, __: Any) -> CoreSchema:
+        return core_schema.no_info_after_validator_function(
+            lambda dct: MCPServerSSE(**dct),
+            core_schema.typed_dict_schema(
+                {
+                    'url': core_schema.typed_dict_field(core_schema.str_schema()),
+                    'headers': core_schema.typed_dict_field(
+                        core_schema.dict_schema(core_schema.str_schema(), core_schema.str_schema()), required=False
+                    ),
+                }
+            ),
+        )
 
     @property
     def _transport_client(self):
         return sse_client  # pragma: no cover
+
+    def __eq__(self, value: object, /) -> bool:
+        if not isinstance(value, MCPServerSSE):
+            return False  # pragma: no cover
+        return self.url == value.url
 
 
 @deprecated('The `MCPServerHTTP` class is deprecated, use `MCPServerSSE` instead.')
@@ -765,7 +806,7 @@ class MCPServerHTTP(MCPServerSSE):
     from pydantic_ai import Agent
     from pydantic_ai.mcp import MCPServerHTTP
 
-    server = MCPServerHTTP('http://localhost:3001/sse')  # (1)!
+    server = MCPServerHTTP('http://localhost:3001/sse')
     agent = Agent('openai:gpt-4o', toolsets=[server])
 
     async def main():
@@ -773,8 +814,7 @@ class MCPServerHTTP(MCPServerSSE):
             ...
     ```
 
-    1. E.g. you might be connecting to a server run with [`mcp-run-python`](../mcp/run-python.md).
-    2. This will connect to a server running on `localhost:3001`.
+    1. This will connect to a server running on `localhost:3001`.
     """
 
 
@@ -802,9 +842,28 @@ class MCPServerStreamableHTTP(_MCPServerHTTP):
     ```
     """
 
+    @classmethod
+    def __get_pydantic_core_schema__(cls, _: Any, __: Any) -> CoreSchema:
+        return core_schema.no_info_after_validator_function(
+            lambda dct: MCPServerStreamableHTTP(**dct),
+            core_schema.typed_dict_schema(
+                {
+                    'url': core_schema.typed_dict_field(core_schema.str_schema()),
+                    'headers': core_schema.typed_dict_field(
+                        core_schema.dict_schema(core_schema.str_schema(), core_schema.str_schema()), required=False
+                    ),
+                }
+            ),
+        )
+
     @property
     def _transport_client(self):
         return streamablehttp_client  # pragma: no cover
+
+    def __eq__(self, value: object, /) -> bool:
+        if not isinstance(value, MCPServerStreamableHTTP):
+            return False  # pragma: no cover
+        return self.url == value.url
 
 
 ToolResult = (
@@ -835,3 +894,50 @@ It accepts a run context, the original tool call function, a tool name, and argu
 Allows wrapping an MCP server tool call to customize it, including adding extra request
 metadata.
 """
+
+
+def _mcp_server_discriminator(value: dict[str, Any]) -> str | None:
+    if 'url' in value:
+        if value['url'].endswith('/sse'):
+            return 'sse'
+        return 'streamable-http'
+    return 'stdio'
+
+
+class MCPServerConfig(BaseModel):
+    """Configuration for MCP servers."""
+
+    mcp_servers: Annotated[
+        dict[
+            str,
+            Annotated[
+                Annotated[MCPServerStdio, Tag('stdio')]
+                | Annotated[MCPServerStreamableHTTP, Tag('streamable-http')]
+                | Annotated[MCPServerSSE, Tag('sse')],
+                Discriminator(_mcp_server_discriminator),
+            ],
+        ],
+        Field(alias='mcpServers'),
+    ]
+
+
+def load_mcp_servers(config_path: str | Path) -> list[MCPServerStdio | MCPServerStreamableHTTP | MCPServerSSE]:
+    """Load MCP servers from a configuration file.
+
+    Args:
+        config_path: The path to the configuration file.
+
+    Returns:
+        A list of MCP servers.
+
+    Raises:
+        FileNotFoundError: If the configuration file does not exist.
+        ValidationError: If the configuration file does not match the schema.
+    """
+    config_path = Path(config_path)
+
+    if not config_path.exists():
+        raise FileNotFoundError(f'Config file {config_path} not found')
+
+    config = MCPServerConfig.model_validate_json(config_path.read_bytes())
+    return list(config.mcp_servers.values())

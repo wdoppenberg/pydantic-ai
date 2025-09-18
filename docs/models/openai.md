@@ -143,6 +143,56 @@ As of 7:48 AM on Wednesday, April 2, 2025, in Tokyo, Japan, the weather is cloud
 
 You can learn more about the differences between the Responses API and Chat Completions API in the [OpenAI API docs](https://platform.openai.com/docs/guides/responses-vs-chat-completions).
 
+#### Referencing earlier responses
+
+The Responses API supports referencing earlier model responses in a new request using a `previous_response_id` parameter, to ensure the full [conversation state](https://platform.openai.com/docs/guides/conversation-state?api-mode=responses#passing-context-from-the-previous-response) including [reasoning items](https://platform.openai.com/docs/guides/reasoning#keeping-reasoning-items-in-context) are kept in context. This is available through the `openai_previous_response_id` field in
+[`OpenAIResponsesModelSettings`][pydantic_ai.models.openai.OpenAIResponsesModelSettings].
+
+```python
+from pydantic_ai import Agent
+from pydantic_ai.models.openai import OpenAIResponsesModel, OpenAIResponsesModelSettings
+
+model = OpenAIResponsesModel('gpt-5')
+agent = Agent(model=model)
+
+result = agent.run_sync('The secret is 1234')
+model_settings = OpenAIResponsesModelSettings(
+    openai_previous_response_id=result.all_messages()[-1].provider_response_id
+)
+result = agent.run_sync('What is the secret code?', model_settings=model_settings)
+print(result.output)
+#> 1234
+```
+
+By passing the `provider_response_id` from an earlier run, you can allow the model to build on its own prior reasoning without needing to resend the full message history.
+
+##### Automatically referencing earlier responses
+
+When the `openai_previous_response_id` field is set to `'auto'`, Pydantic AI will automatically select the most recent `provider_response_id` from message history and omit messages that came before it, letting the OpenAI API leverage server-side history instead for improved efficiency.
+
+```python
+from pydantic_ai import Agent
+from pydantic_ai.models.openai import OpenAIResponsesModel, OpenAIResponsesModelSettings
+
+model = OpenAIResponsesModel('gpt-5')
+agent = Agent(model=model)
+
+result1 = agent.run_sync('Tell me a joke.')
+print(result1.output)
+#> Did you hear about the toothpaste scandal? They called it Colgate.
+
+# When set to 'auto', the most recent provider_response_id
+# and messages after it are sent as request.
+model_settings = OpenAIResponsesModelSettings(openai_previous_response_id='auto')
+result2 = agent.run_sync(
+    'Explain?',
+    message_history=result1.new_messages(),
+    model_settings=model_settings
+)
+print(result2.output)
+#> This is an excellent joke invented by Samuel Colvin, it needs no explanation.
+```
+
 ## OpenAI-compatible Models
 
 Many providers and models are compatible with the OpenAI API, and can be used with `OpenAIChatModel` in Pydantic AI.
@@ -562,4 +612,32 @@ agent = Agent(model)
 result = agent.run_sync('What is the capital of France?')
 print(result.output)
 #> The capital of France is Paris.
+```
+
+### LiteLLM
+
+To use [LiteLLM](https://www.litellm.ai/), set the configs as outlined in the [doc](https://docs.litellm.ai/docs/set_keys). In `LiteLLMProvider`, you can pass `api_base` and `api_key`. The value of these configs will depend on your setup. For example, if you are using OpenAI models, then you need to pass `https://api.openai.com/v1` as the `api_base` and your OpenAI API key as the `api_key`. If you are using a LiteLLM proxy server running on your local machine, then you need to pass `http://localhost:<port>` as the `api_base` and your LiteLLM API key (or a placeholder) as the `api_key`.
+
+To use custom LLMs, use `custom/` prefix in the model name.
+
+Once you have the configs, use the [`LiteLLMProvider`][pydantic_ai.providers.litellm.LiteLLMProvider] as follows:
+
+```python
+from pydantic_ai import Agent
+from pydantic_ai.models.openai import OpenAIChatModel
+from pydantic_ai.providers.litellm import LiteLLMProvider
+
+model = OpenAIChatModel(
+    'openai/gpt-3.5-turbo',
+    provider=LiteLLMProvider(
+        api_base='<api-base-url>',
+        api_key='<api-key>'
+    )
+)
+agent = Agent(model)
+
+result = agent.run_sync('What is the capital of France?')
+print(result.output)
+#> The capital of France is Paris.
+...
 ```

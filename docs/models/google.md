@@ -61,7 +61,7 @@ To use Vertex AI, you may need to set up [application default credentials](https
 
 If you have the [`gcloud` CLI](https://cloud.google.com/sdk/gcloud) installed and configured, you can use:
 
-```python {test="skip"}
+```python {test="ci_only"}
 from pydantic_ai import Agent
 from pydantic_ai.models.google import GoogleModel
 from pydantic_ai.providers.google import GoogleProvider
@@ -87,7 +87,7 @@ credentials = service_account.Credentials.from_service_account_file(
     'path/to/service-account.json',
     scopes=['https://www.googleapis.com/auth/cloud-platform'],
 )
-provider = GoogleProvider(credentials=credentials)
+provider = GoogleProvider(credentials=credentials, project='your-project-id')
 model = GoogleModel('gemini-1.5-flash', provider=provider)
 agent = Agent(model)
 ...
