@@ -274,3 +274,19 @@ async def test_openai_client_chat_completions(async_openai_client):
     assert chat_completion.choices[0].message.role == 'assistant'
     assert chat_completion.choices[0].message.content is not None
     assert chat_completion.choices[0].finish_reason == 'stop'
+
+
+async def test_openai_client_responses(async_openai_client):
+    """Test responses with OpenAI client."""
+    response = await async_openai_client.responses.create(
+        input=[{'role': 'user', 'content': 'Hello, how are you?'}],
+        model='test',
+        stream=False
+    )
+    assert response.model == 'test'
+    for item in response.output:
+        if item.type == 'message':
+            assert item.role == 'assistant'
+            assert item.content is not None
+        else:
+            raise ValueError('Unexpected output type')
