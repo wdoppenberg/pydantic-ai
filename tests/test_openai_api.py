@@ -202,13 +202,15 @@ async def test_responses_endpoint(openai_app):
         async with httpx.AsyncClient(transport=transport) as client:
             client.base_url = 'http://test'
             response = await client.post(
-                '/v1/responses', json={'model': 'test', 'messages': [{'role': 'user', 'content': 'Hello'}]}
+                '/v1/responses', json={'model': 'test', 'input': 'Hello'}
             )
 
-            # Should work the same as chat completions for now
+            # Should return a Response object, not ChatCompletion
             assert response.status_code == HTTPStatus.OK
             data = response.json()
-            assert data['object'] == 'chat.completion'
+            assert data['object'] == 'response'
+            assert 'output' in data
+            assert isinstance(data['output'], list)
 
 
 async def test_to_openai_api_method():

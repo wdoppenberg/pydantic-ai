@@ -47,9 +47,14 @@ from .messages import (
     ModelMessage,
     ModelRequest,
     ModelResponse,
+    ModelResponseStreamEvent,
+    PartDeltaEvent,
+    PartStartEvent,
     SystemPromptPart,
     TextPart,
+    TextPartDelta,
     ToolCallPart,
+    ToolCallPartDelta,
     ToolReturnPart,
     UserPromptPart,
     ModelRequestPart,
@@ -111,7 +116,21 @@ try:
         WebSearchOptionsUserLocation,
         WebSearchOptionsUserLocationApproximate,
     )
-    from openai.types.responses import ComputerToolParam, FileSearchToolParam, WebSearchToolParam
+    from openai.types.responses import (
+        ComputerToolParam,
+        FileSearchToolParam,
+        Response as ResponseObject,
+        ResponseCreateParams as ResponseCreateParamsT,
+        ResponseOutputMessage,
+        ResponseOutputText,
+        ResponseStreamEvent,
+        ResponseUsage,
+        WebSearchToolParam,
+    )
+    from openai.types.responses.response_create_params import (
+        ResponseCreateParamsNonStreaming as ResponseCreateParamsNonStreamingT,
+        ResponseCreateParamsStreaming as ResponseCreateParamsStreamingT,
+    )
     from openai.types.responses.response_input_param import FunctionCallOutput, Message
     from openai.types.shared import ReasoningEffort
     from openai.types.shared_params import Reasoning
@@ -254,6 +273,10 @@ CompletionCreateParams = TypeAdapter(CompletionCreateParamsT)
 CompletionCreateParamsNonStreaming = TypeAdapter(CompletionCreateParamsNonStreamingT)
 CompletionCreateParamsStreaming = TypeAdapter(CompletionCreateParamsStreamingT)
 
+ResponseCreateParams = TypeAdapter(ResponseCreateParamsT)
+ResponseCreateParamsNonStreaming = TypeAdapter(ResponseCreateParamsNonStreamingT)
+ResponseCreateParamsStreaming = TypeAdapter(ResponseCreateParamsStreamingT)
+
 OpenAIRole: TypeAlias = Literal["developer", "system", "assistant", "user", "tool", "function"]
 
 @dataclass
@@ -375,8 +398,82 @@ def _from_openai_messages(messages: Iterable[ChatCompletionMessageParam]) -> lis
                 )
 
             elif role == 'function':
+                # 'function' role is deprecated in OpenAI API but still supported for backward compatibility
+                # It should be treated similarly to 'tool' role
+                request_parts.append(
+                    ToolReturnPart(
+                        tool_call_id=message.get('name', ''),  # function role uses 'name' field
+                        content=str(message.get('content'))
+                    )
+                )
+
+    if request_parts:
+        history.append(ModelRequest(parts=request_parts))
+
+    return history
 
 
+def _from_responses_input(input_data: Any, instructions: str | None = None) -> list[ModelMessage]:
+    """Converts OpenAI Responses API input to Pydantic AI's internal message format.
+
+    The Responses API uses a different input format than Chat Completions:
+    - `input` can be a string (simple user message) or a list of various item types
+    - `instructions` (if provided) acts as a system prompt
+
+    Args:
+        input_data: The input field from ResponseCreateParams - can be str or list of items.
+        instructions: Optional instructions to prepend as a system message.
+
+    Returns:
+        A list of ModelMessage objects representing the conversation in Pydantic AI format.
+
+    Example:
+        ```python
+        messages = _from_responses_input("Hello!", "You are helpful")
+        # Results in system prompt + user message
+        ```
+    """
+    history: list[ModelMessage] = []
+    request_parts: list[ModelRequestPart] = []
+
+    # Handle instructions as system prompt
+    if instructions:
+        request_parts.append(SystemPromptPart(content=instructions))
+
+    # Handle input - can be string or list
+    if isinstance(input_data, str):
+        # Simple string input becomes a user message
+        request_parts.append(UserPromptPart(content=input_data))
+    elif isinstance(input_data, list):
+        # List of items - need to parse each item by type
+        # For now, we'll do a simplified conversion that handles the most common cases
+        for item in input_data:
+            if isinstance(item, dict):
+                item_type = item.get('type')
+                
+                # Handle message items (user/system/assistant)
+                if item_type == 'message':
+                    role = item.get('role', 'user')
+                    content = item.get('content', '')
+                    
+                    if role == 'system':
+                        request_parts.append(SystemPromptPart(content=str(content)))
+                    elif role == 'user':
+                        request_parts.append(UserPromptPart(content=str(content)))
+                    elif role == 'assistant':
+                        # Finish current request if any, start response
+                        if request_parts:
+                            history.append(ModelRequest(parts=request_parts))
+                            request_parts = []
+                        history.append(ModelResponse(parts=[TextPart(content=str(content))]))
+                        
+                # Handle function call outputs (tool returns)
+                elif item_type == 'function_call_output':
+                    call_id = item.get('call_id', '')
+                    output = item.get('output', '')
+                    request_parts.append(ToolReturnPart(tool_call_id=call_id, content=str(output)))
+
+    # Add any remaining request parts
     if request_parts:
         history.append(ModelRequest(parts=request_parts))
 
@@ -452,13 +549,102 @@ def _to_openai_chat_completion(run: AgentRunResult[OutputDataT], model: str) -> 
     )
 
 
-def _to_openai_chat_completion_chunk(
-    node: AgentNode, model: str, run_id: str, context: _StreamContext
-) -> ChatCompletionChunk | None:
-    r"""Converts a Pydantic AI agent execution node to an OpenAI ChatCompletionChunk object.
+def _to_openai_response(run: AgentRunResult[OutputDataT], model: str, input_data: Any, instructions: str | None = None) -> ResponseObject:
+    """Converts a Pydantic AI agent run result to an OpenAI Response object.
+
+    This function transforms the result of a Pydantic AI agent run into a Responses API-compatible
+    Response format. Unlike ChatCompletion which uses `choices`, Response uses an `output` list
+    containing messages and other items.
 
     Args:
-        node: Current node in Agent's execution graph
+        run: The completed agent run result containing the conversation and response data.
+        model: The model name to include in the response metadata.
+        input_data: The original input data from the request.
+        instructions: Optional instructions from the request.
+
+    Returns:
+        An OpenAI Response object with the agent's response formatted according to
+        the Responses API specification.
+
+    Example:
+        ```python
+        response = _to_openai_response(agent_run, "gpt-4o", "Hello", None)
+        print(response.output[0])
+        ```
+    """
+    from openai.types.responses import ResponseFunctionToolCall
+    
+    last_response = next((m for m in reversed(run.all_messages()) if isinstance(m, ModelResponse)), None)
+
+    output: list[Any] = []
+    
+    if last_response:
+        # Build output message with text and tool calls
+        message_content: list[ResponseOutputText] = []
+        
+        for part in last_response.parts:
+            if isinstance(part, TextPart):
+                message_content.append(
+                    ResponseOutputText(
+                        type='output_text',
+                        text=part.content,
+                        annotations=[],
+                    )
+                )
+            elif isinstance(part, ToolCallPart):
+                # Tool calls are separate items in the output list
+                output.append(
+                    ResponseFunctionToolCall(
+                        type='function_tool_call',
+                        call_id=part.tool_call_id,
+                        name=part.tool_name,
+                        arguments=part.args_as_json_str(),
+                    )
+                )
+        
+        # Add message to output if there's any text content
+        if message_content:
+            output.insert(0, ResponseOutputMessage(
+                type='message',
+                id=str(uuid.uuid4()),
+                role='assistant',
+                status='completed',
+                content=message_content,
+            ))
+
+    from openai.types.responses.response_usage import InputTokensDetails, OutputTokensDetails
+    
+    run_usage = run.usage()
+    response_usage = ResponseUsage(
+        input_tokens=run_usage.input_tokens,
+        input_tokens_details=InputTokensDetails(cached_tokens=0),
+        output_tokens=run_usage.output_tokens,
+        output_tokens_details=OutputTokensDetails(reasoning_tokens=0),
+        total_tokens=run_usage.total_tokens,
+    )
+
+    return ResponseObject(
+        id=str(uuid.uuid4()),
+        object='response',
+        created_at=time.time(),
+        model=model,
+        output=output,
+        status='completed',
+        usage=response_usage,
+        instructions=instructions,
+        parallel_tool_calls=True,
+        tool_choice='auto',
+        tools=[],
+    )
+
+
+def _to_openai_chat_completion_chunk(
+    event: ModelResponseStreamEvent, model: str, run_id: str, context: _StreamContext
+) -> ChatCompletionChunk | None:
+    r"""Converts a Pydantic AI agent stream event to an OpenAI ChatCompletionChunk object.
+
+    Args:
+        event: Agent stream event (PartStartEvent or PartDeltaEvent)
         model: The model name to include in the chunk metadata.
         run_id: Unique identifier for the streaming run.
         context: Stream context for maintaining state across chunks.
@@ -475,59 +661,56 @@ def _to_openai_chat_completion_chunk(
             yield f'data: {chunk.model_dump_json()}\n\n'
         ```
     """
-    # delta = ChoiceDelta()
+    delta = ChoiceDelta()
 
-    # if isinstance(event, PartStartEvent):
-    #     if isinstance(event.part, ToolCallPart):
-    #         context.tool_call_part_started = event.part
-    #         context.got_tool_calls = True
-    #
-    # elif isinstance(event, PartDeltaEvent):
-    #     if not context.role_sent:
-    #         delta.role = 'assistant'
-    #         context.role_sent = True
-    #
-    #     if isinstance(event.delta, TextPartDelta):
-    #         delta.content = event.delta.content_delta
-    #     elif isinstance(event.delta, ToolCallPartDelta):
-    #         if context.tool_call_part_started:
-    #             # First delta for a new tool call
-    #             delta.tool_calls = [
-    #                 ChoiceDelta.ToolCall(
-    #                     index=context.tool_call_index,
-    #                     id=context.tool_call_part_started.tool_call_id,
-    #                     type='function',
-    #                     function=ChoiceDelta.ToolCall.Function(
-    #                         name=context.tool_call_part_started.tool_name,
-    #                         arguments=event.delta.arguments_delta,
-    #                     ),
-    #                 )
-    #             ]
-    #             context.tool_call_part_started = None  # Consume it
-    #         else:
-    #             # Subsequent delta for the same tool call
-    #             delta.tool_calls = [
-    #                 ChoiceDelta.ToolCall(
-    #                     index=context.tool_call_index,
-    #                     function=ChoiceDelta.ToolCall.Function(arguments=event.delta.arguments_delta),
-    #                 )
-    #             ]
-    #
-    # elif isinstance(event, FinalResultEvent):
-    #     if isinstance(event.part, ToolCallPart):
-    #         context.tool_call_index += 1
-    #         context.tool_call_part_started = None
-    #
-    # if not delta.role and not delta.content and not delta.tool_calls:
-    #     return None
-    #
-    # return ChatCompletionChunk(
-    #     id=run_id,
-    #     choices=[ChunkChoice(delta=delta, index=0, finish_reason=None, logprobs=None)],
-    #     created=int(time.time()),
-    #     model=model,
-    #     object='chat.completion.chunk',
-    # )
+    if isinstance(event, PartStartEvent):
+        if isinstance(event.part, ToolCallPart):
+            context.tool_call_part_started = event.part
+            context.got_tool_calls = True
+
+    elif isinstance(event, PartDeltaEvent):
+        if not context.role_sent:
+            delta.role = 'assistant'
+            context.role_sent = True
+
+        if isinstance(event.delta, TextPartDelta):
+            delta.content = event.delta.content_delta
+        elif isinstance(event.delta, ToolCallPartDelta):
+            if context.tool_call_part_started:
+                # First delta for a new tool call
+                delta.tool_calls = [
+                    ChoiceDelta.ToolCall(
+                        index=context.tool_call_index,
+                        id=context.tool_call_part_started.tool_call_id,
+                        type='function',
+                        function=ChoiceDelta.ToolCall.Function(
+                            name=context.tool_call_part_started.tool_name,
+                            arguments=event.delta.args_delta if isinstance(event.delta.args_delta, str) else json.dumps(event.delta.args_delta),
+                        ),
+                    )
+                ]
+                context.tool_call_part_started = None  # Consume it
+            else:
+                # Subsequent delta for the same tool call
+                delta.tool_calls = [
+                    ChoiceDelta.ToolCall(
+                        index=context.tool_call_index,
+                        function=ChoiceDelta.ToolCall.Function(
+                            arguments=event.delta.args_delta if isinstance(event.delta.args_delta, str) else json.dumps(event.delta.args_delta)
+                        ),
+                    )
+                ]
+
+    if not delta.role and not delta.content and not delta.tool_calls:
+        return None
+
+    return ChatCompletionChunk(
+        id=run_id,
+        choices=[ChunkChoice(delta=delta, index=0, finish_reason=None, logprobs=None)],
+        created=int(time.time()),
+        model=model,
+        object='chat.completion.chunk',
+    )
 
 
 async def handle_chat_completions_request(
@@ -601,6 +784,9 @@ async def handle_chat_completions_request(
         context = _StreamContext()
 
         async def stream_generator() -> AsyncIterator[str]:
+            from ._agent_graph import ModelRequestNode
+            from pydantic_graph import End
+            
             async with agent.iter(message_history=messages, **agent_kwargs) as run:
                 async for node in run:
                     if isinstance(node, End):
@@ -618,9 +804,12 @@ async def handle_chat_completions_request(
                         )
                         yield f'data: {final_chunk.model_dump_json(exclude_unset=True)}\n\n'
                         yield 'data: [DONE]\n\n'
-
-                    else:
-                        chunk = _to_openai_chat_completion_chunk(node, params.get('model'), run_id, context)
+                    elif isinstance(node, ModelRequestNode):
+                        async with node.stream(run.ctx) as request_stream:
+                            async for agent_event in request_stream:
+                                chunk = _to_openai_chat_completion_chunk(agent_event, params.get('model'), run_id, context)
+                                if chunk:
+                                    yield f'data: {chunk.model_dump_json(exclude_unset=True)}\n\n'
 
         return StreamingResponse(
             stream_generator(),
@@ -648,4 +837,81 @@ async def handle_responses_request(
     infer_name: bool = True,
     toolsets: Sequence[AbstractToolset[AgentDepsT]] | None = None,
 ) -> Response:
-    raise NotImplementedError
+    """Handles OpenAI Responses API requests.
+
+    This function processes HTTP requests to the `/v1/responses` endpoint,
+    providing OpenAI Responses API compatibility for Pydantic AI agents. Unlike
+    Chat Completions, the Responses API uses different request/response formats
+    with `input` instead of `messages` and `output` instead of `choices`.
+
+    Args:
+        agent: The Pydantic AI agent to run for generating responses.
+        request: The HTTP request containing the response parameters.
+
+        output_type: Custom output type to use for this run, `output_type` may only be used if the agent has
+            no output validators since output validators would expect an argument that matches the agent's
+            output type.
+        model: Optional model to use for this run, required if `model` was not set when creating the agent.
+        deps: Optional dependencies to use for this run.
+        model_settings: Optional settings to use for this model's request.
+        usage_limits: Optional limits on model request count or token usage.
+        usage: Optional usage to start with, useful for resuming a conversation or agents used in tools.
+        infer_name: Whether to try to infer the agent name from the call frame if it's not set.
+        toolsets: Optional additional toolsets for this run.
+
+    Returns:
+        A Starlette Response object containing either:
+        - A StreamingResponse with server-sent events for streaming requests (not yet implemented)
+        - A JSON Response with the complete Response object for non-streaming requests
+        - An error response for invalid requests
+
+    Example:
+        ```python
+        response = await handle_responses_request(agent, request)
+        ```
+    """
+    try:
+        params: ResponseCreateParamsT = ResponseCreateParams.validate_python(await request.json())
+    except ValidationError as e:  # pragma: no cover
+        return Response(
+            content=json.dumps(e.json()),
+            media_type='application/json',
+            status_code=HTTPStatus.UNPROCESSABLE_ENTITY,
+        )
+
+    # Extract input and instructions from Responses API format
+    input_data = params.get('input')
+    instructions = params.get('instructions')
+    
+    # Convert Responses API input to internal message format
+    messages = _from_responses_input(input_data, instructions)
+    
+    agent_kwargs = dict(
+        output_type=output_type,
+        model=model or params.get('model'),
+        deps=deps,
+        model_settings=model_settings,
+        usage_limits=usage_limits,
+        usage=usage,
+        infer_name=infer_name,
+        toolsets=toolsets,
+    )
+
+    # For now, only support non-streaming responses
+    # Streaming could be added in the future using ResponseStreamEvent
+    if params.get('stream'):
+        # TODO: Implement streaming support for Responses API
+        return Response(
+            content=json.dumps({'error': 'Streaming not yet supported for Responses API'}),
+            media_type='application/json',
+            status_code=HTTPStatus.NOT_IMPLEMENTED,
+        )
+    
+    # Run the agent and convert to Response format
+    run_result = await agent.run(message_history=messages, **agent_kwargs)
+    response_obj = _to_openai_response(run_result, model=params.get('model'), input_data=input_data, instructions=instructions)
+    
+    return Response(
+        content=response_obj.model_dump_json(exclude_unset=True),
+        media_type='application/json',
+    )
