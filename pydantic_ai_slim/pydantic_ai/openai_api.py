@@ -26,26 +26,25 @@ from __future__ import annotations
 import json
 import time
 import uuid
-from collections.abc import AsyncIterator, Iterable, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import (
     Any,
-    Callable,
     Generic,
-    Literal, TypeAlias,
+    Literal,
+    TypeAlias,
 )
 
 from pydantic import TypeAdapter, ValidationError
 
-from pydantic_graph import End
-
-from ._agent_graph import AgentNode
 from .agent import AbstractAgent
 from .messages import (
+    BinaryContent,
     ImageUrl,
     ModelMessage,
     ModelRequest,
+    ModelRequestPart,
     ModelResponse,
     ModelResponseStreamEvent,
     PartDeltaEvent,
@@ -56,10 +55,8 @@ from .messages import (
     ToolCallPart,
     ToolCallPartDelta,
     ToolReturnPart,
-    UserPromptPart,
-    ModelRequestPart,
     UserContent,
-    BinaryContent,
+    UserPromptPart,
 )
 from .models import KnownModelName, Model
 from .output import OutputDataT, OutputSpec
@@ -83,57 +80,35 @@ except ImportError as e:  # pragma: no cover
     ) from e
 
 try:
-    from openai.types import AllModels, CompletionUsage, chat, responses
+    from openai.types import CompletionUsage
     from openai.types.chat import (
         ChatCompletion,
         ChatCompletionChunk,
-        ChatCompletionContentPartImageParam,
-        ChatCompletionContentPartInputAudioParam,
-        ChatCompletionContentPartParam,
-        ChatCompletionContentPartTextParam,
         ChatCompletionMessage,
         ChatCompletionMessageParam,
         CompletionCreateParams as CompletionCreateParamsT,
     )
     from openai.types.chat.chat_completion import Choice
     from openai.types.chat.chat_completion_chunk import Choice as ChunkChoice, ChoiceDelta
-    from openai.types.chat.chat_completion_content_part_image_param import ImageURL
-    from openai.types.chat.chat_completion_content_part_input_audio_param import InputAudio
-    from openai.types.chat.chat_completion_content_part_param import File, FileFile
-    from openai.types.chat.chat_completion_message_custom_tool_call import ChatCompletionMessageCustomToolCall
     from openai.types.chat.chat_completion_message_function_tool_call import (
         ChatCompletionMessageFunctionToolCall,
         Function,
     )
-    from openai.types.chat.chat_completion_message_function_tool_call_param import (
-        ChatCompletionMessageFunctionToolCallParam,
-    )
-    from openai.types.chat.chat_completion_prediction_content_param import ChatCompletionPredictionContentParam
     from openai.types.chat.completion_create_params import (
         CompletionCreateParamsNonStreaming as CompletionCreateParamsNonStreamingT,
         CompletionCreateParamsStreaming as CompletionCreateParamsStreamingT,
-        WebSearchOptions,
-        WebSearchOptionsUserLocation,
-        WebSearchOptionsUserLocationApproximate,
     )
     from openai.types.responses import (
-        ComputerToolParam,
-        FileSearchToolParam,
         Response as ResponseObject,
         ResponseCreateParams as ResponseCreateParamsT,
         ResponseOutputMessage,
         ResponseOutputText,
-        ResponseStreamEvent,
         ResponseUsage,
-        WebSearchToolParam,
     )
     from openai.types.responses.response_create_params import (
         ResponseCreateParamsNonStreaming as ResponseCreateParamsNonStreamingT,
         ResponseCreateParamsStreaming as ResponseCreateParamsStreamingT,
     )
-    from openai.types.responses.response_input_param import FunctionCallOutput, Message
-    from openai.types.shared import ReasoningEffort
-    from openai.types.shared_params import Reasoning
 except ImportError as _import_error:
     raise ImportError(
         'Please install `openai` to use the OpenAI model, '
@@ -277,7 +252,8 @@ ResponseCreateParams = TypeAdapter(ResponseCreateParamsT)
 ResponseCreateParamsNonStreaming = TypeAdapter(ResponseCreateParamsNonStreamingT)
 ResponseCreateParamsStreaming = TypeAdapter(ResponseCreateParamsStreamingT)
 
-OpenAIRole: TypeAlias = Literal["developer", "system", "assistant", "user", "tool", "function"]
+OpenAIRole: TypeAlias = Literal['developer', 'system', 'assistant', 'user', 'tool', 'function']
+
 
 @dataclass
 class _StreamContext:
@@ -298,6 +274,129 @@ class _StreamContext:
     tool_call_part_started: ToolCallPart | None = None
     tool_call_index: int = 0
     got_tool_calls: bool = False
+
+
+def _parse_user_content_part(part: dict[str, Any]) -> UserContent | None:
+    """Parse a single user content part from OpenAI format.
+
+    Args:
+        part: A dictionary representing a content part.
+
+    Returns:
+        A UserContent object or None if the part type is not recognized.
+    """
+    part_type = part.get('type')
+
+    if part_type == 'text':
+        return part.get('text', '')
+
+    elif part_type == 'image_url':
+        image_url = part.get('image_url')
+        url = image_url.get('url', '')
+        return ImageUrl(url=url)
+
+    elif part_type == 'input_audio':
+        input_audio = part['input_audio']
+        data = input_audio['data']
+        format = input_audio['format']
+        # Only wav and mp3 are supported currently
+        media_type = 'audio/wav' if format == 'wav' else 'audio/mpeg'
+        return BinaryContent(data=data, media_type=media_type)
+
+    # TODO: Handle 'File' type
+    return None
+
+
+def _handle_assistant_message(message: ChatCompletionMessageParam) -> ModelResponse:
+    """Handle an assistant role message and convert to ModelResponse.
+
+    Args:
+        message: OpenAI assistant message.
+
+    Returns:
+        A ModelResponse with text and tool call parts.
+    """
+    response_parts: list[TextPart | ToolCallPart] = []
+    
+    if content := message.get('content'):
+        # TODO: Handle 'Iterable[ContentArrayOfContentPart]'
+        #  This is now simply stringified
+        response_parts.append(TextPart(content=str(content)))
+
+    if tool_calls := message.get('tool_calls'):
+        for tc in tool_calls:
+            response_parts.append(
+                # All fields are Required[] so indexing is safe
+                ToolCallPart(
+                    tool_call_id=tc['id'],
+                    tool_name=tc['function']['name'],
+                    # Store as json string
+                    args=tc['function']['arguments'],
+                )
+            )
+    
+    return ModelResponse(parts=response_parts)
+
+
+def _handle_user_message(message: ChatCompletionMessageParam, request_parts: list[ModelRequestPart]) -> None:
+    """Handle a user role message and append to request_parts.
+
+    Args:
+        message: OpenAI user message.
+        request_parts: List to append the parsed user prompt part to.
+    """
+    content = message.get('content')
+    if isinstance(content, str):
+        request_parts.append(UserPromptPart(content=content))
+    elif content:  # should be a list
+        parts: list[UserContent] = []
+        for part in content:
+            parsed_part = _parse_user_content_part(part)
+            if parsed_part is not None:
+                parts.append(parsed_part)
+
+        if parts:
+            request_parts.append(UserPromptPart(content=parts))
+
+
+def _handle_system_message(message: ChatCompletionMessageParam, request_parts: list[ModelRequestPart]) -> None:
+    """Handle a system role message and append to request_parts.
+
+    Args:
+        message: OpenAI system message.
+        request_parts: List to append the system prompt part to.
+    """
+    if content := message.get('content'):
+        request_parts.append(SystemPromptPart(content=str(content)))
+
+
+def _handle_tool_message(message: ChatCompletionMessageParam, request_parts: list[ModelRequestPart]) -> None:
+    """Handle a tool role message and append to request_parts.
+
+    Args:
+        message: OpenAI tool message.
+        request_parts: List to append the tool return part to.
+    """
+    request_parts.append(
+        ToolReturnPart(tool_call_id=message.get('tool_call_id', ''), content=str(message.get('content')))
+    )
+
+
+def _handle_function_message(message: ChatCompletionMessageParam, request_parts: list[ModelRequestPart]) -> None:
+    """Handle a function role message and append to request_parts.
+
+    'function' role is deprecated in OpenAI API but still supported for backward compatibility.
+
+    Args:
+        message: OpenAI function message.
+        request_parts: List to append the tool return part to.
+    """
+    request_parts.append(
+        ToolReturnPart(
+            tool_call_id=message.get('name', ''),  # function role uses 'name' field
+            content=str(message.get('content')),
+        )
+    )
 
 
 def _from_openai_messages(messages: Iterable[ChatCompletionMessageParam]) -> list[ModelMessage]:
@@ -332,80 +431,21 @@ def _from_openai_messages(messages: Iterable[ChatCompletionMessageParam]) -> lis
         role: OpenAIRole | None = message.get('role')
 
         if role is None:
-            raise RuntimeError("No role found in message.")
+            raise RuntimeError('No role found in message.')
 
         if role == 'assistant':
             if request_parts:
                 history.append(ModelRequest(parts=request_parts))
                 request_parts = []
-            response_parts: list[TextPart | ToolCallPart] = []
-            if content := message.get('content'):
-                # TODO: Handle 'Iterable[ContentArrayOfContentPart]'
-                #  This is now simply stringified
-                response_parts.append(TextPart(content=str(content)))
-
-            if tool_calls := message.get('tool_calls'):
-                for tc in tool_calls:
-                    response_parts.append(
-                        # All fields are Required[] so indexing is safe
-                        ToolCallPart(
-                            tool_call_id=tc['id'],
-                            tool_name=tc['function']['name'],
-                            # Store as json string
-                            args=tc['function']['arguments'],
-                        )
-                    )
-            history.append(ModelResponse(parts=response_parts))
-        else:
-            if role == 'system':
-                if content := message.get('content'):
-                    request_parts.append(SystemPromptPart(content=str(content)))
-
-            elif role == 'user':
-                content = message.get('content')
-                if isinstance(content, str):
-                    request_parts.append(UserPromptPart(content=content))
-                elif content:  # should be a list
-                    parts: list[UserContent] = []
-                    for part in content:
-                        part_type = part.get('type')
-
-                        if part_type == 'text':
-                            parts.append(part.get('text', ''))
-
-                        elif part_type == 'image_url':
-                            image_url = part.get('image_url')
-                            url = image_url.get('url', '')
-                            parts.append(ImageUrl(url=url))
-
-                        elif part_type == 'input_audio':
-                            input_audio = part['input_audio']
-                            data = input_audio['data']
-                            format = input_audio['format']
-
-                            # Only wav and mp3 are supported currently
-                            media_type = 'audio/wav' if format == 'wav' else 'audio/mpeg'
-
-                            parts.append(BinaryContent(data=data, media_type=media_type))
-
-                        # TODO: Handle 'File' type
-
-                    if parts:
-                        request_parts.append(UserPromptPart(content=parts))
-            elif role == 'tool':
-                request_parts.append(
-                    ToolReturnPart(tool_call_id=message.get('tool_call_id', ''), content=str(message.get('content')))
-                )
-
-            elif role == 'function':
-                # 'function' role is deprecated in OpenAI API but still supported for backward compatibility
-                # It should be treated similarly to 'tool' role
-                request_parts.append(
-                    ToolReturnPart(
-                        tool_call_id=message.get('name', ''),  # function role uses 'name' field
-                        content=str(message.get('content'))
-                    )
-                )
+            history.append(_handle_assistant_message(message))
+        elif role == 'system':
+            _handle_system_message(message, request_parts)
+        elif role == 'user':
+            _handle_user_message(message, request_parts)
+        elif role == 'tool':
+            _handle_tool_message(message, request_parts)
+        elif role == 'function':
+            _handle_function_message(message, request_parts)
 
     if request_parts:
         history.append(ModelRequest(parts=request_parts))
@@ -450,12 +490,12 @@ def _from_responses_input(input_data: Any, instructions: str | None = None) -> l
         for item in input_data:
             if isinstance(item, dict):
                 item_type = item.get('type')
-                
+
                 # Handle message items (user/system/assistant)
                 if item_type == 'message':
                     role = item.get('role', 'user')
                     content = item.get('content', '')
-                    
+
                     if role == 'system':
                         request_parts.append(SystemPromptPart(content=str(content)))
                     elif role == 'user':
@@ -466,7 +506,7 @@ def _from_responses_input(input_data: Any, instructions: str | None = None) -> l
                             history.append(ModelRequest(parts=request_parts))
                             request_parts = []
                         history.append(ModelResponse(parts=[TextPart(content=str(content))]))
-                        
+
                 # Handle function call outputs (tool returns)
                 elif item_type == 'function_call_output':
                     call_id = item.get('call_id', '')
@@ -549,7 +589,9 @@ def _to_openai_chat_completion(run: AgentRunResult[OutputDataT], model: str) -> 
     )
 
 
-def _to_openai_response(run: AgentRunResult[OutputDataT], model: str, input_data: Any, instructions: str | None = None) -> ResponseObject:
+def _to_openai_response(
+    run: AgentRunResult[OutputDataT], model: str, input_data: Any, instructions: str | None = None
+) -> ResponseObject:
     """Converts a Pydantic AI agent run result to an OpenAI Response object.
 
     This function transforms the result of a Pydantic AI agent run into a Responses API-compatible
@@ -573,15 +615,15 @@ def _to_openai_response(run: AgentRunResult[OutputDataT], model: str, input_data
         ```
     """
     from openai.types.responses import ResponseFunctionToolCall
-    
+
     last_response = next((m for m in reversed(run.all_messages()) if isinstance(m, ModelResponse)), None)
 
     output: list[Any] = []
-    
+
     if last_response:
         # Build output message with text and tool calls
         message_content: list[ResponseOutputText] = []
-        
+
         for part in last_response.parts:
             if isinstance(part, TextPart):
                 message_content.append(
@@ -601,19 +643,22 @@ def _to_openai_response(run: AgentRunResult[OutputDataT], model: str, input_data
                         arguments=part.args_as_json_str(),
                     )
                 )
-        
+
         # Add message to output if there's any text content
         if message_content:
-            output.insert(0, ResponseOutputMessage(
-                type='message',
-                id=str(uuid.uuid4()),
-                role='assistant',
-                status='completed',
-                content=message_content,
-            ))
+            output.insert(
+                0,
+                ResponseOutputMessage(
+                    type='message',
+                    id=str(uuid.uuid4()),
+                    role='assistant',
+                    status='completed',
+                    content=message_content,
+                ),
+            )
 
     from openai.types.responses.response_usage import InputTokensDetails, OutputTokensDetails
-    
+
     run_usage = run.usage()
     response_usage = ResponseUsage(
         input_tokens=run_usage.input_tokens,
@@ -685,7 +730,9 @@ def _to_openai_chat_completion_chunk(
                         type='function',
                         function=ChoiceDelta.ToolCall.Function(
                             name=context.tool_call_part_started.tool_name,
-                            arguments=event.delta.args_delta if isinstance(event.delta.args_delta, str) else json.dumps(event.delta.args_delta),
+                            arguments=event.delta.args_delta
+                            if isinstance(event.delta.args_delta, str)
+                            else json.dumps(event.delta.args_delta),
                         ),
                     )
                 ]
@@ -696,7 +743,9 @@ def _to_openai_chat_completion_chunk(
                     ChoiceDelta.ToolCall(
                         index=context.tool_call_index,
                         function=ChoiceDelta.ToolCall.Function(
-                            arguments=event.delta.args_delta if isinstance(event.delta.args_delta, str) else json.dumps(event.delta.args_delta)
+                            arguments=event.delta.args_delta
+                            if isinstance(event.delta.args_delta, str)
+                            else json.dumps(event.delta.args_delta)
                         ),
                     )
                 ]
@@ -784,9 +833,10 @@ async def handle_chat_completions_request(
         context = _StreamContext()
 
         async def stream_generator() -> AsyncIterator[str]:
-            from ._agent_graph import ModelRequestNode
             from pydantic_graph import End
-            
+
+            from ._agent_graph import ModelRequestNode
+
             async with agent.iter(message_history=messages, **agent_kwargs) as run:
                 async for node in run:
                     if isinstance(node, End):
@@ -807,7 +857,9 @@ async def handle_chat_completions_request(
                     elif isinstance(node, ModelRequestNode):
                         async with node.stream(run.ctx) as request_stream:
                             async for agent_event in request_stream:
-                                chunk = _to_openai_chat_completion_chunk(agent_event, params.get('model'), run_id, context)
+                                chunk = _to_openai_chat_completion_chunk(
+                                    agent_event, params.get('model'), run_id, context
+                                )
                                 if chunk:
                                     yield f'data: {chunk.model_dump_json(exclude_unset=True)}\n\n'
 
@@ -882,10 +934,10 @@ async def handle_responses_request(
     # Extract input and instructions from Responses API format
     input_data = params.get('input')
     instructions = params.get('instructions')
-    
+
     # Convert Responses API input to internal message format
     messages = _from_responses_input(input_data, instructions)
-    
+
     agent_kwargs = dict(
         output_type=output_type,
         model=model or params.get('model'),
@@ -906,11 +958,13 @@ async def handle_responses_request(
             media_type='application/json',
             status_code=HTTPStatus.NOT_IMPLEMENTED,
         )
-    
+
     # Run the agent and convert to Response format
     run_result = await agent.run(message_history=messages, **agent_kwargs)
-    response_obj = _to_openai_response(run_result, model=params.get('model'), input_data=input_data, instructions=instructions)
-    
+    response_obj = _to_openai_response(
+        run_result, model=params.get('model'), input_data=input_data, instructions=instructions
+    )
+
     return Response(
         content=response_obj.model_dump_json(exclude_unset=True),
         media_type='application/json',
