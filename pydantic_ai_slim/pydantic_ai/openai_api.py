@@ -4,21 +4,6 @@ This module provides OpenAI API-compatible endpoints for Pydantic AI agents, all
 as drop-in replacements for OpenAI's Chat Completions API and Responses API. The module includes
 functionality for handling both streaming and non-streaming requests, tool calls, multimodal inputs,
 and conversation history.
-
-Example:
-    ```python
-    from pydantic_ai import Agent
-    from pydantic_ai.openai_api import OpenAIApp
-
-    agent = Agent('openai:gpt-4o')
-    app = OpenAIApp(agent)
-    ```
-
-    The `app` is an ASGI application that can be used with any ASGI server:
-
-    ```bash
-    uvicorn app:app --host 0.0.0.0 --port 8000
-    ```
 """
 
 from __future__ import annotations
@@ -276,6 +261,30 @@ class _StreamContext:
     got_tool_calls: bool = False
 
 
+@dataclass
+class _ResponseStreamContext:
+    """Internal context for tracking streaming Responses API state.
+
+    This dataclass maintains state information during streaming responses to ensure
+    proper OpenAI Responses API-compatible event generation.
+
+    Attributes:
+        sequence_number: Sequential counter for events in the stream.
+        item_id: The current output item ID being streamed.
+        output_index: The index of the output item in the response.
+        content_index: The index of the content part within the output item.
+        message_added: Whether the output message item has been added yet.
+        content_part_added: Whether the content part has been added yet.
+    """
+
+    sequence_number: int = 0
+    item_id: str = ''
+    output_index: int = 0
+    content_index: int = 0
+    message_added: bool = False
+    content_part_added: bool = False
+
+
 def _parse_user_content_part(part: dict[str, Any]) -> UserContent | None:
     """Parse a single user content part from OpenAI format.
 
@@ -317,7 +326,7 @@ def _handle_assistant_message(message: ChatCompletionMessageParam) -> ModelRespo
         A ModelResponse with text and tool call parts.
     """
     response_parts: list[TextPart | ToolCallPart] = []
-    
+
     if content := message.get('content'):
         # TODO: Handle 'Iterable[ContentArrayOfContentPart]'
         #  This is now simply stringified
@@ -334,7 +343,7 @@ def _handle_assistant_message(message: ChatCompletionMessageParam) -> ModelRespo
                     args=tc['function']['arguments'],
                 )
             )
-    
+
     return ModelResponse(parts=response_parts)
 
 
@@ -683,6 +692,113 @@ def _to_openai_response(
     )
 
 
+def _to_openai_response_stream_event(
+    event: ModelResponseStreamEvent,
+    model: str,
+    response_id: str,
+    context: _ResponseStreamContext,
+) -> Any | None:
+    r"""Converts a Pydantic AI agent stream event to an OpenAI Response API stream event.
+
+    Args:
+        event: Agent stream event (PartStartEvent or PartDeltaEvent)
+        model: The model name to include in event metadata.
+        response_id: Unique identifier for the streaming response.
+        context: Stream context for maintaining state across events.
+
+    Returns:
+        An OpenAI ResponseStreamEvent object if the event contains streamable content,
+        or None if the event should be skipped in the stream.
+
+    Example:
+        ```python
+        context = _ResponseStreamContext()
+        stream_event = _to_openai_response_stream_event(event, "gpt-4o", response_id, context)
+        if stream_event:
+            yield f'event: {stream_event.type}\ndata: {stream_event.model_dump_json()}\n\n'
+        ```
+    """
+    from openai.types.responses import (
+        ResponseContentPartAddedEvent,
+        ResponseOutputItemAddedEvent,
+        ResponseOutputMessage,
+        ResponseOutputText,
+        ResponseTextDeltaEvent,
+    )
+
+    # Initialize item_id if not set
+    if not context.item_id:
+        context.item_id = str(uuid.uuid4())
+
+    events: list[Any] = []
+
+    if isinstance(event, PartStartEvent):
+        if isinstance(event.part, TextPart):
+            # When we start a text part, we need to:
+            # 1. Add output item (message) if not already added
+            # 2. Add content part (output_text)
+
+            if not context.message_added:
+                # Add the message output item
+                message_item = ResponseOutputMessage(
+                    type='message',
+                    id=context.item_id,
+                    role='assistant',
+                    status='in_progress',
+                    content=[],
+                )
+                events.append(
+                    ResponseOutputItemAddedEvent(
+                        type='response.output_item.added',
+                        item=message_item,
+                        output_index=context.output_index,
+                        sequence_number=context.sequence_number,
+                    )
+                )
+                context.sequence_number += 1
+                context.message_added = True
+
+            # Add the content part
+            if not context.content_part_added:
+                content_part = ResponseOutputText(
+                    type='output_text',
+                    text='',
+                    annotations=[],
+                )
+                events.append(
+                    ResponseContentPartAddedEvent(
+                        type='response.content_part.added',
+                        item_id=context.item_id,
+                        output_index=context.output_index,
+                        content_index=context.content_index,
+                        part=content_part,
+                        sequence_number=context.sequence_number,
+                    )
+                )
+                context.sequence_number += 1
+                context.content_part_added = True
+
+    elif isinstance(event, PartDeltaEvent):
+        if isinstance(event.delta, TextPartDelta):
+            # Send text delta
+            events.append(
+                ResponseTextDeltaEvent(
+                    type='response.output_text.delta',
+                    item_id=context.item_id,
+                    output_index=context.output_index,
+                    content_index=context.content_index,
+                    delta=event.delta.content_delta,
+                    logprobs=[],
+                    sequence_number=context.sequence_number,
+                )
+            )
+            context.sequence_number += 1
+
+    # Return the first event if any, or None
+    # For simplicity, we return one event at a time
+    return events[0] if events else None
+
+
 def _to_openai_chat_completion_chunk(
     event: ModelResponseStreamEvent, model: str, run_id: str, context: _StreamContext
 ) -> ChatCompletionChunk | None:
@@ -949,23 +1065,104 @@ async def handle_responses_request(
         toolsets=toolsets,
     )
 
-    # For now, only support non-streaming responses
-    # Streaming could be added in the future using ResponseStreamEvent
     if params.get('stream'):
-        # TODO: Implement streaming support for Responses API
-        return Response(
-            content=json.dumps({'error': 'Streaming not yet supported for Responses API'}),
-            media_type='application/json',
-            status_code=HTTPStatus.NOT_IMPLEMENTED,
+        # Streaming support for Responses API
+        from openai.types.responses import (
+            Response as ResponseObject,
+            ResponseCompletedEvent,
+            ResponseCreatedEvent,
+        )
+        from openai.types.responses.response_usage import InputTokensDetails, OutputTokensDetails
+
+        response_id = str(uuid.uuid4())
+        context = _ResponseStreamContext()
+
+        async def stream_generator() -> AsyncIterator[str]:
+            from pydantic_graph import End
+
+            from ._agent_graph import ModelRequestNode
+
+            # Send initial response.created event
+            initial_response = ResponseObject(
+                id=response_id,
+                object='response',
+                created_at=time.time(),
+                model=params.get('model'),
+                output=[],
+                status='in_progress',
+                usage=ResponseUsage(
+                    input_tokens=0,
+                    input_tokens_details=InputTokensDetails(cached_tokens=0),
+                    output_tokens=0,
+                    output_tokens_details=OutputTokensDetails(reasoning_tokens=0),
+                    total_tokens=0,
+                ),
+                instructions=instructions,
+                parallel_tool_calls=True,
+                tool_choice='auto',
+                tools=[],
+            )
+            created_event = ResponseCreatedEvent(
+                type='response.created',
+                response=initial_response,
+                sequence_number=context.sequence_number,
+            )
+            context.sequence_number += 1
+            yield f'event: {created_event.type}\ndata: {created_event.model_dump_json(exclude_unset=True)}\n\n'
+
+            # Stream the agent's response
+            async with agent.iter(message_history=messages, **agent_kwargs) as run:
+                async for node in run:
+                    if isinstance(node, End):
+                        # Send final response.completed event
+                        run_usage = run.usage()
+                        final_response = ResponseObject(
+                            id=response_id,
+                            object='response',
+                            created_at=initial_response.created_at,
+                            model=params.get('model'),
+                            output=[],
+                            status='completed',
+                            usage=ResponseUsage(
+                                input_tokens=run_usage.input_tokens,
+                                input_tokens_details=InputTokensDetails(cached_tokens=0),
+                                output_tokens=run_usage.output_tokens,
+                                output_tokens_details=OutputTokensDetails(reasoning_tokens=0),
+                                total_tokens=run_usage.total_tokens,
+                            ),
+                            instructions=instructions,
+                            parallel_tool_calls=True,
+                            tool_choice='auto',
+                            tools=[],
+                        )
+                        completed_event = ResponseCompletedEvent(
+                            type='response.completed',
+                            response=final_response,
+                            sequence_number=context.sequence_number,
+                        )
+                        yield f'event: {completed_event.type}\ndata: {completed_event.model_dump_json(exclude_unset=True)}\n\n'
+                        yield 'event: done\ndata: [DONE]\n\n'
+                    elif isinstance(node, ModelRequestNode):
+                        async with node.stream(run.ctx) as request_stream:
+                            async for agent_event in request_stream:
+                                stream_event = _to_openai_response_stream_event(
+                                    agent_event, params.get('model'), response_id, context
+                                )
+                                if stream_event:
+                                    yield f'event: {stream_event.type}\ndata: {stream_event.model_dump_json(exclude_unset=True)}\n\n'
+
+        return StreamingResponse(
+            stream_generator(),
+            media_type='text/event-stream',
+        )
+    else:
+        # Run the agent and convert to Response format
+        run_result = await agent.run(message_history=messages, **agent_kwargs)
+        response_obj = _to_openai_response(
+            run_result, model=params.get('model'), input_data=input_data, instructions=instructions
         )
 
-    # Run the agent and convert to Response format
-    run_result = await agent.run(message_history=messages, **agent_kwargs)
-    response_obj = _to_openai_response(
-        run_result, model=params.get('model'), input_data=input_data, instructions=instructions
-    )
-
-    return Response(
-        content=response_obj.model_dump_json(exclude_unset=True),
-        media_type='application/json',
-    )
+        return Response(
+            content=response_obj.model_dump_json(exclude_unset=True),
+            media_type='application/json',
+        )
