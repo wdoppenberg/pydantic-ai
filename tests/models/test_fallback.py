@@ -138,6 +138,7 @@ def test_first_failed_instrumented(capfire: CaptureLogfire) -> None:
                         'output_object': None,
                         'output_tools': [],
                         'allow_text_output': True,
+                        'allow_image_output': False,
                     },
                     'logfire.span_type': 'span',
                     'logfire.msg': 'chat fallback:function:failure_response:,function:success_response:',
@@ -238,6 +239,7 @@ async def test_first_failed_instrumented_stream(capfire: CaptureLogfire) -> None
                         'output_object': None,
                         'output_tools': [],
                         'allow_text_output': True,
+                        'allow_image_output': False,
                     },
                     'logfire.span_type': 'span',
                     'logfire.msg': 'chat fallback:function::failure_response_stream,function::success_response_stream',
@@ -272,6 +274,7 @@ async def test_first_failed_instrumented_stream(capfire: CaptureLogfire) -> None
                     'gen_ai.agent.name': 'agent',
                     'logfire.msg': 'agent run',
                     'logfire.span_type': 'span',
+                    'final_result': 'hello world',
                     'gen_ai.usage.input_tokens': 50,
                     'gen_ai.usage.output_tokens': 2,
                     'pydantic_ai.all_messages': [
@@ -345,6 +348,7 @@ def test_all_failed_instrumented(capfire: CaptureLogfire) -> None:
                         'output_object': None,
                         'output_tools': [],
                         'allow_text_output': True,
+                        'allow_image_output': False,
                     },
                     'logfire.json_schema': {
                         'type': 'object',
